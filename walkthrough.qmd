@@ -1,0 +1,207 @@
+---
+title: "Atlas Notebook Development Guide"
+format:
+  html: 
+    toc: true
+    toc-depth: 3
+    css: styles.css
+---
+
+# Part 1: Data Preperation
+
+## Basic Steps
+1. Load in the processed data in raster format
+2. Extract the data for each administrative level
+3. Format the admin levels and merge the tables
+4. Write to a cloud-optimized file format
+
+At the most basic level, data for the Atlas should look something like this to allow for easy swapping of the data source.
+
+```{r}
+#| echo: false
+
+example_data <- data.frame(
+  admin0_name = c("Angola", "Kenya", "Zambia"),
+  admin1_name = c(NA, "Nairobi", "Lusaka"),
+  admin2_name = c(NA, NA, "Kafue"),
+  variable = c("rural", "urban", "rural"), 
+  value = c(100, 200, 300) 
+)
+
+knitr::kable(example_data)
+
+```
+
+
+This format was chosen to allow for easier filtering of the data using SQL within the notebook. Note that pivoting to long format is not strictly required, and in some cases it may actually reduce performance and compression of the parquet file. 
+
+```{r}
+#| code-fold: true
+#| code-summary: "Show the code"
+#| warning: false
+#| message: false
+
+library(dplyr)
+library(terra) 
+library(arrow)
+library(tidyr)
+library(exactextractr) # Much faster than terra::extract
+library(sf) # Required by exactextractr
+
+
+# Set the paths to the data
+admin_paths <- c(
+  "data/atlas-region_admin0_simplified.parquet",
+  "data/atlas-region_admin1_simplified.parquet",
+  "data/atlas-region_admin2_simplified.parquet")
+
+raster_path <- "data/example.tif"
+
+data_raster <- terra::rast(raster_path)
+
+extract_data <- function(admin_path, raster) {
+  admin_bounds <- sf::st_read(admin_path, quiet = TRUE)
+  data <- exactextractr::exact_extract(raster, admin_bounds,
+    fun = "sum", force_df = TRUE, progress = FALSE)
+  names(data) <- names(raster)
+  admin_cols <- grepl('admin[0-9]', names(admin_bounds))
+  admin_data <- cbind(sf::st_drop_geometry(admin_bounds)[admin_cols], data)
+}
+
+admin0_extraced <- extract_data(admin_paths[1], data_raster)
+admin0_extraced$admin1_name <- NA
+admin0_extraced$admin2_name <- NA
+admin1_extraced <- extract_data(admin_paths[2], data_raster)
+admin1_extraced$admin2_name <- NA
+admin2_extraced <- extract_data(admin_paths[3], data_raster)
+
+cols <- c("admin0_name", "admin1_name", "admin2_name", names(data_raster))
+
+wide_df <- rbind(admin0_extraced[cols],
+  admin1_extraced[cols],
+  admin2_extraced[cols])
+
+long_df <- tidyr::pivot_longer(wide_df, names(wide_df[-c(1:3)]), names_to = "variable")
+
+arrow::write_parquet(long_df, "data/extracted-data.parquet")
+
+```
+
+::: {.panel-tabset}
+
+## Raster Data
+```{r}
+#| echo: false
+
+plot(data_raster$cattle)
+plot(vect(admin_paths[1]), add = TRUE)
+```
+
+## Extracted Table
+```{r}
+#| echo: false
+
+DT::datatable(subset(long_df, variable == "cattle"))
+```
+
+## Admin Data
+```{r}
+#| echo: false
+
+spatial_data <- terra::merge(vect(admin_paths[1]), subset(wide_df, is.na(admin1_name)), by = "admin0_name")
+plot(spatial_data, "cattle", type = "continuous")
+```
+
+:::
+
+# Part 2: Notebook Development
+The Observable Notebook version can be found [here](https://observablehq.com/d/375b6157a12ccb57)
+
+## Load the data into the notebook
+
+```{ojs}
+admin0_boundaries = {
+  let a0_topoj = await FileAttachment("data/atlas-region_admin0.json").json();
+  return topojson.feature(
+    a0_topoj,
+    a0_topoj.objects["atlas-region_admin0_harmonized"]
+  );
+}
+```
+
+```{ojs}
+admin0_names = admin0_boundaries.features.map((d) => d.properties.admin0_name)
+```
+
+```{ojs}
+database = DuckDBClient.of({
+  example: FileAttachment("data/extracted-data.parquet")
+})
+```
+
+
+```{ojs}
+viewof country = Inputs.select(["SSA"].concat(admin0_names), { label: "Country Selector" })
+
+viewof variable = {
+  let vars = await database.query(`SELECT DISTINCT(variable) FROM example`);
+  return Inputs.select(
+    vars.map((v) => v.variable),
+    { label: "Variable Selection" }
+  );
+}
+```
+
+## Query the data based on the selection
+
+```{ojs}
+country_bounds = new Object({
+  type: "FeatureCollection",
+  name: "country_selection",
+  features:
+    country === "SSA"
+      ? admin0_boundaries.features
+      : admin0_boundaries.features.filter(
+          (d) => d.properties.admin0_name === country
+        )
+})
+
+data = {
+  let admin0_query = country === "SSA" ? "" : `AND admin0_name = '${country}'`;
+  return await database.query(
+    `SELECT * FROM EXAMPLE WHERE variable = '${variable}' and admin1_name IS NULL ${admin0_query}`
+  );
+}
+
+spatial_data_map = new Map(
+  data.map(({ admin0_name, value }) => [admin0_name, value])
+)
+```
+
+## Plot the data
+
+```{ojs}
+Plot.plot({
+  projection: {
+    type: "azimuthal-equal-area",
+    domain: country_bounds
+  },
+  color: {
+    scheme: "spectral",
+    unknown: "#ddd",
+    type: "log",
+    legend: true, // Add the legend
+    label: `Data for ${variable} in ${country}`,
+    domain: d3.extent(data.map((d) => d.value)) // Update the value domain to span 0 to 100% access
+  },
+  marks: [
+    Plot.geo(country_bounds, {
+      fill: (d) => spatial_data_map.get(d.properties.admin0_name),
+      stroke: "black"
+    })
+  ]
+})
+```
+
+
+
